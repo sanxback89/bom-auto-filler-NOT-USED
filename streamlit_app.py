@@ -1,10 +1,9 @@
 """
-BOM PDF -> Excel Auto Filler  (Streamlit Web App)
+BOM PDF → Excel Auto Filler + 비교 분석  (Streamlit Web App)
 
-기존 tkinter GUI의 모든 기능을 100% 동일하게 웹에서 제공합니다.
-- 단일 PDF  → 단일 Excel 파일
-- 복수 PDF  → 하나의 Excel 파일, PDF별 시트 분리
-- 이미지 처리 (Design Image, BOM Row Image, Graphic Color Image) 동일
+모드:
+1. BOM 분석 자동화  — PDF → Excel 변환 (단일/복수)
+2. Updated BOM 비교 — 이전 Excel + 새 PDF → 변경사항 하이라이트
 """
 
 import os
@@ -14,12 +13,16 @@ import tempfile
 import streamlit as st
 from openpyxl import load_workbook
 
-# 같은 디렉토리의 모듈을 import 할 수 있도록 경로 보장
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
 
-from excel_writer import fill_template, fill_sheet, sanitize_sheet_name
+from excel_writer import fill_sheet, sanitize_sheet_name
+from pdf_parser import parse_master_from_pdf, extract_bom_rows_from_pdf
+from models import group_rows_by_material
+from excel_reader import read_excel_bom
+from bom_comparator import compare_boms
+from excel_diff_writer import apply_highlights, create_summary_sheet
 
 # ── 페이지 설정 ──────────────────────────────────────────────
 st.set_page_config(
@@ -28,178 +31,338 @@ st.set_page_config(
     layout="centered",
 )
 
-st.title("📋 BOM PDF → Excel 자동 입력")
-st.caption("PDF에서 BOM 데이터를 추출하여 Excel 양식에 자동으로 입력합니다.")
-
 DEFAULT_TEMPLATE = os.path.join(_APP_DIR, "양식.xlsx")
 
 # ── Session State 초기화 ─────────────────────────────────────
-if "result" not in st.session_state:
-    st.session_state.result = None        # (filename, bytes)
-if "logs" not in st.session_state:
-    st.session_state.logs = []
+if "result_mode1" not in st.session_state:
+    st.session_state.result_mode1 = None
+if "logs_mode1" not in st.session_state:
+    st.session_state.logs_mode1 = []
+if "result_mode2" not in st.session_state:
+    st.session_state.result_mode2 = None
+if "logs_mode2" not in st.session_state:
+    st.session_state.logs_mode2 = []
 
-# ── 1) Excel 양식 선택 ──────────────────────────────────────
-st.subheader("1. Excel 양식 선택")
+# ── 사이드바: 모드 선택 ──────────────────────────────────────
+with st.sidebar:
+    st.header("모드 선택")
+    mode = st.radio(
+        "",
+        ["📋 BOM 분석 자동화", "🔄 Updated BOM 비교"],
+        label_visibility="collapsed",
+    )
 
-has_default = os.path.exists(DEFAULT_TEMPLATE)
-template_options = (
-    ["기본 내장 양식 (양식.xlsx)", "직접 업로드"]
-    if has_default else ["직접 업로드"]
-)
-template_option = st.radio("양식을 선택하세요:", options=template_options, horizontal=True)
+    st.divider()
 
-uploaded_template = None
-if template_option == "직접 업로드":
-    uploaded_template = st.file_uploader("Excel 양식 파일 (.xlsx)", type=["xlsx"], key="tpl")
+    if mode == "📋 BOM 분석 자동화":
+        st.markdown(
+            "**BOM PDF를 Excel 양식에 자동 입력**\n\n"
+            "- 단일/복수 PDF 지원\n"
+            "- 이미지, 컬러값 자동 매핑\n"
+            "- 복수 PDF → 시트별 분리"
+        )
+    else:
+        st.markdown(
+            "**이전 Excel과 새 PDF를 비교하여**\n"
+            "**변경사항을 자동 감지**\n\n"
+            "- 🟡 변경/추가된 셀 → 노랑\n"
+            "- 🔴 삭제된 행 → 빨강 취소선\n"
+            "- 변경사항 요약 시트 자동 생성"
+        )
 
-# ── 2) BOM PDF 업로드 ───────────────────────────────────────
-st.subheader("2. BOM PDF 업로드")
-uploaded_pdfs = st.file_uploader(
-    "BOM PDF 파일 (복수 선택 가능)",
-    type=["pdf"],
-    accept_multiple_files=True,
-    key="pdfs",
-)
+    st.divider()
+    st.caption("v2.0")
 
-# ── 3) 실행 ─────────────────────────────────────────────────
-st.subheader("3. 실행")
+# ══════════════════════════════════════════════════════════════
+# 모드 1: BOM 분석 자동화
+# ══════════════════════════════════════════════════════════════
+if mode == "📋 BOM 분석 자동화":
+    st.title("📋 BOM 분석 자동화")
 
-can_run = bool(uploaded_pdfs)
-if template_option == "직접 업로드" and uploaded_template is None:
-    can_run = False
+    # ── 1) Excel 양식 선택 ──
+    st.subheader("1. Excel 양식")
+    has_default = os.path.exists(DEFAULT_TEMPLATE)
+    template_options = (
+        ["기본 내장 양식 (양식.xlsx)", "직접 업로드"]
+        if has_default else ["직접 업로드"]
+    )
+    template_option = st.radio(
+        "양식 선택", options=template_options, horizontal=True, key="tpl_opt_1",
+        label_visibility="collapsed",
+    )
 
-if st.button("🚀 실행하기", disabled=not can_run, use_container_width=True, type="primary"):
-    st.session_state.result = None
-    st.session_state.logs = []
-    logs = st.session_state.logs
-    total = len(uploaded_pdfs)
+    uploaded_template = None
+    if template_option == "직접 업로드":
+        uploaded_template = st.file_uploader("Excel 양식 (.xlsx)", type=["xlsx"], key="tpl_1")
 
-    with st.status(f"📋 {total}개 PDF 처리 중...", expanded=True) as status:
-        progress = st.progress(0, text="준비 중...")
+    # ── 2) BOM PDF 업로드 ──
+    st.subheader("2. BOM PDF")
+    uploaded_pdfs = st.file_uploader(
+        "PDF 파일 (복수 선택 가능)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="pdfs_1",
+    )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # ── 양식 파일 준비 ──
-            if template_option == "직접 업로드":
-                tpl_path = os.path.join(tmpdir, "template.xlsx")
-                with open(tpl_path, "wb") as f:
-                    f.write(uploaded_template.getvalue())
-            else:
-                tpl_path = DEFAULT_TEMPLATE
+    # ── 3) 실행 ──
+    can_run = bool(uploaded_pdfs)
+    if template_option == "직접 업로드" and uploaded_template is None:
+        can_run = False
 
-            # ── PDF 임시 저장 ──
-            pdf_paths = []
-            for i, pdf_file in enumerate(uploaded_pdfs):
-                p = os.path.join(tmpdir, f"{i}_{pdf_file.name}")
-                with open(p, "wb") as f:
-                    f.write(pdf_file.getvalue())
-                pdf_paths.append(p)
+    st.divider()
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            if total == 1:
-                # ── 단일 PDF → 단일 파일 ──
-                pdf_name = uploaded_pdfs[0].name
-                base_name = os.path.splitext(pdf_name)[0]
-                out_name = f"{base_name}_filled.xlsx"
+    if st.button("실행", disabled=not can_run, use_container_width=True, type="primary", key="run_1"):
+        st.session_state.result_mode1 = None
+        st.session_state.logs_mode1 = []
+        logs = st.session_state.logs_mode1
+        total = len(uploaded_pdfs)
+
+        with st.status(f"{total}개 PDF 변환 중...", expanded=True) as status:
+            progress = st.progress(0, text="준비 중...")
+
+            tmpdir = tempfile.mkdtemp()
+            try:
+                if template_option == "직접 업로드":
+                    tpl_path = os.path.join(tmpdir, "template.xlsx")
+                    with open(tpl_path, "wb") as f:
+                        f.write(uploaded_template.getvalue())
+                else:
+                    tpl_path = DEFAULT_TEMPLATE
+
+                pdf_paths = []
+                for i, pdf_file in enumerate(uploaded_pdfs):
+                    p = os.path.join(tmpdir, f"{i}.pdf")
+                    with open(p, "wb") as f:
+                        f.write(pdf_file.getvalue())
+                    pdf_paths.append(p)
+
+                if total == 1:
+                    pdf_name = uploaded_pdfs[0].name
+                    base_name = os.path.splitext(pdf_name)[0]
+                    out_name = f"{base_name}_filled.xlsx"
+                    out_path = os.path.join(tmpdir, out_name)
+
+                    progress.progress(0, text=f"처리 중: {pdf_name}")
+                    logs.append(f"[1/1] {pdf_name}")
+
+                    try:
+                        wb = load_workbook(tpl_path)
+                        ws = wb.active
+                        fill_sheet(ws, pdf_paths[0])
+                        wb.save(out_path)
+                        wb.close()
+                        logs.append(f"   완료: {out_name}")
+                        with open(out_path, "rb") as f:
+                            st.session_state.result_mode1 = (out_name, f.read())
+                    except Exception as e:
+                        logs.append(f"   실패: {e}")
+                        st.error(f"실패: {e}")
+
+                    progress.progress(1.0, text="완료!")
+                else:
+                    wb = load_workbook(tpl_path)
+                    original_sheets = list(wb.sheetnames)
+                    template_ws = wb.active
+                    sheet_names_used = set()
+                    success_count = 0
+                    fail_count = 0
+
+                    for idx, (pdf_path, pdf_file) in enumerate(zip(pdf_paths, uploaded_pdfs)):
+                        pdf_name = pdf_file.name
+                        progress.progress(idx / total, text=f"[{idx + 1}/{total}] {pdf_name}")
+                        logs.append(f"[{idx + 1}/{total}] {pdf_name}")
+                        try:
+                            new_ws = wb.copy_worksheet(template_ws)
+                            design_number = fill_sheet(new_ws, pdf_path)
+                            name = design_number or os.path.splitext(pdf_name)[0]
+                            name = sanitize_sheet_name(name)
+                            base_name = name
+                            counter = 1
+                            while name in sheet_names_used:
+                                s = f"_{counter}"
+                                name = sanitize_sheet_name(base_name[:31 - len(s)] + s)
+                                counter += 1
+                            sheet_names_used.add(name)
+                            new_ws.title = name
+                            logs.append(f"   완료 → 시트: {name}")
+                            success_count += 1
+                        except Exception as e:
+                            logs.append(f"   실패: {e}")
+                            fail_count += 1
+
+                    for sn in original_sheets:
+                        if sn in wb.sheetnames:
+                            wb.remove(wb[sn])
+
+                    out_name = "BOM_combined_filled.xlsx"
+                    out_path = os.path.join(tmpdir, out_name)
+                    wb.save(out_path)
+                    wb.close()
+                    with open(out_path, "rb") as f:
+                        st.session_state.result_mode1 = (out_name, f.read())
+                    progress.progress(1.0, text="완료!")
+                    logs.append(f"성공 {success_count}개 / 실패 {fail_count}개")
+
+            finally:
+                import shutil
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+            status.update(label="완료!", state="complete")
+
+    # ── 결과 다운로드 (실행 완료 후에만) ──
+    if st.session_state.result_mode1:
+        fname, fbytes = st.session_state.result_mode1
+        st.success(f"✅ {fname}")
+        st.download_button(
+            label="📥 다운로드",
+            data=fbytes,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    if st.session_state.logs_mode1:
+        with st.expander("처리 로그", expanded=False):
+            st.code("\n".join(st.session_state.logs_mode1), language=None)
+
+# ══════════════════════════════════════════════════════════════
+# 모드 2: Updated BOM 비교
+# ══════════════════════════════════════════════════════════════
+else:
+    st.title("🔄 Updated BOM 비교")
+
+    # ── 1) Excel 양식 선택 ──
+    st.subheader("1. Excel 양식")
+    has_default = os.path.exists(DEFAULT_TEMPLATE)
+    template_options = (
+        ["기본 내장 양식 (양식.xlsx)", "직접 업로드"]
+        if has_default else ["직접 업로드"]
+    )
+    template_option = st.radio(
+        "양식 선택", options=template_options, horizontal=True, key="tpl_opt_2",
+        label_visibility="collapsed",
+    )
+
+    uploaded_template = None
+    if template_option == "직접 업로드":
+        uploaded_template = st.file_uploader("Excel 양식 (.xlsx)", type=["xlsx"], key="tpl_2")
+
+    # ── 2) 이전 Excel ──
+    st.subheader("2. 이전 Excel")
+    uploaded_prev_excel = st.file_uploader(
+        "이전에 생성한 BOM Excel",
+        type=["xlsx"],
+        key="prev_excel_2",
+    )
+
+    # ── 3) 새 BOM PDF ──
+    st.subheader("3. 새 BOM PDF")
+    uploaded_new_pdf = st.file_uploader(
+        "업데이트된 BOM PDF",
+        type=["pdf"],
+        accept_multiple_files=False,
+        key="new_pdf_2",
+    )
+
+    # ── 4) 실행 ──
+    can_run = bool(uploaded_prev_excel and uploaded_new_pdf)
+    if template_option == "직접 업로드" and uploaded_template is None:
+        can_run = False
+
+    st.divider()
+
+    if st.button("비교 실행", disabled=not can_run, use_container_width=True, type="primary", key="run_2"):
+        st.session_state.result_mode2 = None
+        st.session_state.logs_mode2 = []
+        logs = st.session_state.logs_mode2
+
+        with st.status("비교 분석 중...", expanded=True) as status:
+            progress = st.progress(0, text="준비 중...")
+
+            tmpdir = tempfile.mkdtemp()
+            try:
+                if template_option == "직접 업로드":
+                    tpl_path = os.path.join(tmpdir, "template.xlsx")
+                    with open(tpl_path, "wb") as f:
+                        f.write(uploaded_template.getvalue())
+                else:
+                    tpl_path = DEFAULT_TEMPLATE
+
+                prev_path = os.path.join(tmpdir, "prev.xlsx")
+                with open(prev_path, "wb") as f:
+                    f.write(uploaded_prev_excel.getvalue())
+
+                pdf_path = os.path.join(tmpdir, "new.pdf")
+                with open(pdf_path, "wb") as f:
+                    f.write(uploaded_new_pdf.getvalue())
+
+                base_name = os.path.splitext(uploaded_new_pdf.name)[0]
+                out_name = f"{base_name}_compared.xlsx"
                 out_path = os.path.join(tmpdir, out_name)
 
-                progress.progress(0, text=f"처리 중: {pdf_name}")
-                st.write(f"📄 처리 중: **{pdf_name}**")
-                logs.append(f"📄 [1/1] 처리 중: {pdf_name}")
-
                 try:
-                    fill_template(tpl_path, pdf_paths[0], out_path)
-                    logs.append(f"   ✅ 완료: {out_name}")
-                    st.write(f"   ✅ 완료")
+                    progress.progress(0.2, text="PDF 변환 중...")
+                    logs.append(f"새 PDF: {uploaded_new_pdf.name}")
 
+                    wb = load_workbook(tpl_path)
+                    ws = wb.active
+                    fill_sheet(ws, pdf_path)
+                    logs.append("   BOM 데이터 입력 완료")
+
+                    progress.progress(0.4, text="이전 Excel 읽는 중...")
+                    old_rows, old_colors, old_master = read_excel_bom(prev_path)
+                    logs.append(f"   이전: {len(old_rows)}행, {len(old_colors)}컬러")
+
+                    progress.progress(0.6, text="비교 중...")
+                    new_master = parse_master_from_pdf(pdf_path)
+                    raw_rows, new_colors = extract_bom_rows_from_pdf(pdf_path)
+                    new_rows = group_rows_by_material(raw_rows)
+                    logs.append(f"   새로: {len(new_rows)}행, {len(new_colors)}컬러")
+
+                    diff = compare_boms(
+                        old_rows, old_colors, old_master,
+                        new_rows, new_colors, new_master,
+                    )
+
+                    progress.progress(0.8, text="하이라이트 적용 중...")
+                    if diff.has_changes:
+                        apply_highlights(ws, diff, new_colors)
+                        create_summary_sheet(wb, diff)
+                        for line in diff.summary_lines():
+                            logs.append(line)
+                        logs.append("   하이라이트 적용 완료")
+                    else:
+                        logs.append("   변경사항 없음")
+
+                    wb.save(out_path)
+                    wb.close()
                     with open(out_path, "rb") as f:
-                        st.session_state.result = (out_name, f.read())
+                        st.session_state.result_mode2 = (out_name, f.read())
+
                 except Exception as e:
-                    logs.append(f"   ❌ 실패: {e}")
+                    logs.append(f"   실패: {e}")
                     st.error(f"실패: {e}")
 
                 progress.progress(1.0, text="완료!")
 
-            else:
-                # ── 복수 PDF → 하나의 파일, 시트별 분리 ──
-                wb = load_workbook(tpl_path)
-                original_sheets = list(wb.sheetnames)
-                template_ws = wb.active
+            finally:
+                import shutil
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
-                sheet_names_used = set()
-                success_count = 0
-                fail_count = 0
+            status.update(label="비교 완료!", state="complete")
 
-                for idx, (pdf_path, pdf_file) in enumerate(
-                    zip(pdf_paths, uploaded_pdfs)
-                ):
-                    pdf_name = pdf_file.name
-                    progress.progress(
-                        idx / total,
-                        text=f"[{idx + 1}/{total}] {pdf_name}",
-                    )
-                    st.write(f"📄 [{idx + 1}/{total}] **{pdf_name}**")
-                    logs.append(f"📄 [{idx + 1}/{total}] 처리 중: {pdf_name}")
+    # ── 결과 다운로드 (실행 완료 후에만) ──
+    if st.session_state.result_mode2:
+        fname, fbytes = st.session_state.result_mode2
+        st.success(f"✅ {fname}")
+        st.download_button(
+            label="📥 다운로드",
+            data=fbytes,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
-                    try:
-                        new_ws = wb.copy_worksheet(template_ws)
-                        design_number = fill_sheet(new_ws, pdf_path)
-
-                        # 시트 이름 결정
-                        name = design_number or os.path.splitext(pdf_name)[0]
-                        name = sanitize_sheet_name(name)
-                        base_name = name
-                        counter = 1
-                        while name in sheet_names_used:
-                            suffix = f"_{counter}"
-                            name = sanitize_sheet_name(
-                                base_name[: 31 - len(suffix)] + suffix
-                            )
-                            counter += 1
-                        sheet_names_used.add(name)
-                        new_ws.title = name
-
-                        logs.append(f"   ✅ 완료 → 시트: {name}")
-                        st.write(f"   ✅ → 시트: **{name}**")
-                        success_count += 1
-
-                    except Exception as e:
-                        logs.append(f"   ❌ 실패: {e}")
-                        st.write(f"   ❌ 실패: {e}")
-                        fail_count += 1
-
-                # 원본 템플릿 시트 모두 삭제
-                for sn in original_sheets:
-                    if sn in wb.sheetnames:
-                        wb.remove(wb[sn])
-
-                out_name = "BOM_combined_filled.xlsx"
-                out_path = os.path.join(tmpdir, out_name)
-                wb.save(out_path)
-
-                with open(out_path, "rb") as f:
-                    st.session_state.result = (out_name, f.read())
-
-                progress.progress(1.0, text="완료!")
-                logs.append(
-                    f"\n📊 결과: 성공 {success_count}개 / 실패 {fail_count}개"
-                )
-
-        status.update(label="✅ 처리 완료!", state="complete")
-
-# ── 4) 결과 다운로드 ────────────────────────────────────────
-if st.session_state.result:
-    st.subheader("4. 결과 다운로드")
-    fname, fbytes = st.session_state.result
-    st.download_button(
-        label=f"📥 {fname} 다운로드",
-        data=fbytes,
-        file_name=fname,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-
-# ── 5) 처리 로그 ────────────────────────────────────────────
-if st.session_state.logs:
-    with st.expander("📋 처리 로그", expanded=False):
-        st.code("\n".join(st.session_state.logs))
+    if st.session_state.logs_mode2:
+        with st.expander("처리 로그", expanded=False):
+            st.code("\n".join(st.session_state.logs_mode2), language=None)

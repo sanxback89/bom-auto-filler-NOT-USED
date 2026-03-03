@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 nul
 *.tmp
+TEST/
+0차/
+1차/
+2차/
