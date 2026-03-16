@@ -11,25 +11,6 @@ import sys
 import tempfile
 
 import streamlit as st
-
-# ── IP 접근 제한 ──────────────────────────────────────────────
-ALLOWED_IPS = ["1.1.1.1"]  # 테스트용: 일부러 다른 IP만 허용
-
-try:
-    from streamlit.web.server.websocket_headers import _get_websocket_headers
-    headers = _get_websocket_headers()
-    if headers:
-        client_ip = headers.get("X-Forwarded-For", "unknown").split(",")[0].strip()
-    else:
-        client_ip = "unknown"
-except Exception:
-    client_ip = "unknown"
-
-if client_ip not in ALLOWED_IPS:
-    st.set_page_config(page_title="접근 제한", page_icon="⛔")
-    st.error(f"⛔ 접근이 허용되지 않은 IP입니다. (감지된 IP: {client_ip})")
-    st.stop()
-# ── IP 접근 제한 끝 ───────────────────────────────────────────
 from openpyxl import load_workbook
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
