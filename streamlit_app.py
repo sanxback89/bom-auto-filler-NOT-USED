@@ -13,6 +13,16 @@ import tempfile
 import streamlit as st
 from openpyxl import load_workbook
 
+# ── [테스트] IP 감지 확인 ─────────────────────────────────────
+# 이 코드는 IP가 정상 감지되는지 확인 후 제거 예정
+try:
+    headers = st.context.headers
+    client_ip = headers.get("X-Forwarded-For", "감지불가").split(",")[0].strip()
+    st.sidebar.caption(f"감지된 IP: {client_ip}")
+except Exception as e:
+    st.sidebar.caption(f"IP 감지 실패: {e}")
+# ── [테스트] 끝 ───────────────────────────────────────────────
+
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
